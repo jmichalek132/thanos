@@ -297,24 +297,29 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ioutil.ReadAll dynamically adjust the byte slice for read data, starting from 512B.
 	// Since this is receive hot path, grow upfront saving allocations and CPU time.
-	compressed := bytes.Buffer{}
-	if r.ContentLength >= 0 {
-		compressed.Grow(int(r.ContentLength))
-	} else {
-		compressed.Grow(512)
-	}
-	_, err := io.Copy(&compressed, r.Body)
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
-		return
-	}
+	var err error
+	var reqBuf []byte
+	tracing.DoInSpan(ctx, "receive_tsdb_write_timeseries", func(_ context.Context) {
+		compressed := bytes.Buffer{}
+		if r.ContentLength >= 0 {
+			compressed.Grow(int(r.ContentLength))
+		} else {
+			compressed.Grow(512)
+		}
+		_, err := io.Copy(&compressed, r.Body)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
+			return
+		}
 
-	reqBuf, err := s2.Decode(nil, compressed.Bytes())
-	if err != nil {
-		level.Error(h.logger).Log("msg", "snappy decode error", "err", err)
-		http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
-		return
-	}
+		reqBuf, err = s2.Decode(nil, compressed.Bytes())
+		if err != nil {
+			level.Error(h.logger).Log("msg", "snappy decode error", "err", err)
+			http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
+			return
+		}
+	})
+
 
 	// NOTE: Due to zero copy ZLabels, Labels used from WriteRequests keeps memory
 	// from the whole request. Ensure that we always copy those when we want to
