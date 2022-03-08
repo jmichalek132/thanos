@@ -299,7 +299,7 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	// Since this is receive hot path, grow upfront saving allocations and CPU time.
 	var err error
 	var reqBuf []byte
-	tracing.DoInSpan(ctx, "receive_tsdb_write_timeseries", func(_ context.Context) {
+	tracing.DoInSpan(ctx, "receive_http_decompress", func(_ context.Context) {
 		compressed := bytes.Buffer{}
 		if r.ContentLength >= 0 {
 			compressed.Grow(int(r.ContentLength))
@@ -325,10 +325,13 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	// from the whole request. Ensure that we always copy those when we want to
 	// store them for longer time.
 	var wreq prompb.WriteRequest
-	if err := proto.Unmarshal(reqBuf, &wreq); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+	tracing.DoInSpan(ctx, "receive_http_unmarshal_response", func(ctx context.Context) {
+		if err := proto.Unmarshal(reqBuf, &wreq); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	})
+
 
 	rep := uint64(0)
 	// If the header is empty, we assume the request is not yet replicated.

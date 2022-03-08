@@ -5,6 +5,7 @@ package receive
 
 import (
 	"context"
+	"github.com/opentracing/opentracing-go"
 	"github.com/thanos-io/thanos/pkg/tracing"
 
 	"github.com/go-kit/log"
@@ -68,8 +69,11 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		ref  storage.SeriesRef
 		errs errutil.MultiError
 	)
+	timeseriesCount := 0
+	samplesCount := 0
 	tracing.DoInSpan(ctx, "receive_tsdb_write_timeseries", func(_ context.Context) {
 		for _, t := range wreq.Timeseries {
+			timeseriesCount += 1
 			lset := labelpb.ZLabelsToPromLabels(t.Labels)
 
 			// Check if the TSDB has cached reference for those labels.
@@ -83,6 +87,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 
 			// Append as many valid samples as possible, but keep track of the errors.
 			for _, s := range t.Samples {
+				samplesCount += 1
 				ref, err = app.Append(ref, lset, s.Timestamp, s.Value)
 				switch err {
 				case storage.ErrOutOfOrderSample:
@@ -128,7 +133,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 				}
 			}
 		}
-	})
+	}, opentracing.Tags{"timeseriesCount": timeseriesCount, "samplesCount": samplesCount})
 
 
 	if numOutOfOrder > 0 {
