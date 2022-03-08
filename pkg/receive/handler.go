@@ -311,13 +311,14 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
 			return
 		}
-
+		span2, _ := tracing.StartSpan(r.Context(), "receive_http_decompress_decode")
 		reqBuf, err = s2.Decode(nil, compressed.Bytes())
 		if err != nil {
 			level.Error(h.logger).Log("msg", "snappy decode error", "err", err)
 			http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
 			return
 		}
+		span2.Finish()
 	})
 
 

@@ -5,7 +5,6 @@ package receive
 
 import (
 	"context"
-	"github.com/opentracing/opentracing-go"
 	"github.com/thanos-io/thanos/pkg/tracing"
 
 	"github.com/go-kit/log"
@@ -71,70 +70,71 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 	)
 	timeseriesCount := 0
 	samplesCount := 0
-	tracing.DoInSpan(ctx, "receive_tsdb_write_timeseries", func(_ context.Context) {
-		for _, t := range wreq.Timeseries {
-			timeseriesCount += 1
-			lset := labelpb.ZLabelsToPromLabels(t.Labels)
+	span, _ := tracing.StartSpan(ctx, "receive_tsdb_write_timeseries")
+	for _, t := range wreq.Timeseries {
+		timeseriesCount += 1
+		lset := labelpb.ZLabelsToPromLabels(t.Labels)
 
-			// Check if the TSDB has cached reference for those labels.
-			ref, lset = getRef.GetRef(lset)
-			if ref == 0 {
-				// If not, copy labels, as TSDB will hold those strings long term. Given no
-				// copy unmarshal we don't want to keep memory for whole protobuf, only for labels.
-				labelpb.ReAllocZLabelsStrings(&t.Labels)
-				lset = labelpb.ZLabelsToPromLabels(t.Labels)
+		// Check if the TSDB has cached reference for those labels.
+		ref, lset = getRef.GetRef(lset)
+		if ref == 0 {
+			// If not, copy labels, as TSDB will hold those strings long term. Given no
+			// copy unmarshal we don't want to keep memory for whole protobuf, only for labels.
+			labelpb.ReAllocZLabelsStrings(&t.Labels)
+			lset = labelpb.ZLabelsToPromLabels(t.Labels)
+		}
+
+		// Append as many valid samples as possible, but keep track of the errors.
+		for _, s := range t.Samples {
+			samplesCount += 1
+			ref, err = app.Append(ref, lset, s.Timestamp, s.Value)
+			switch err {
+			case storage.ErrOutOfOrderSample:
+				numOutOfOrder++
+				level.Debug(r.logger).Log("msg", "Out of order sample", "lset", lset, "sample", s)
+			case storage.ErrDuplicateSampleForTimestamp:
+				numDuplicates++
+				level.Debug(r.logger).Log("msg", "Duplicate sample for timestamp", "lset", lset, "sample", s)
+			case storage.ErrOutOfBounds:
+				numOutOfBounds++
+				level.Debug(r.logger).Log("msg", "Out of bounds metric", "lset", lset, "sample", s)
 			}
+		}
 
-			// Append as many valid samples as possible, but keep track of the errors.
-			for _, s := range t.Samples {
-				samplesCount += 1
-				ref, err = app.Append(ref, lset, s.Timestamp, s.Value)
+		// Current implemetation of app.AppendExemplar doesn't create a new series, so it must be already present.
+		// We drop the exemplars in case the series doesn't exist.
+		if ref != 0 && len(t.Exemplars) > 0 {
+			for _, ex := range t.Exemplars {
+				exLset := labelpb.ZLabelsToPromLabels(ex.Labels)
+				logger := log.With(r.logger, "exemplarLset", exLset, "exemplar", ex.String())
+
+				_, err = app.AppendExemplar(ref, lset, exemplar.Exemplar{
+					Labels: exLset,
+					Value:  ex.Value,
+					Ts:     ex.Timestamp,
+					HasTs:  true,
+				})
 				switch err {
-				case storage.ErrOutOfOrderSample:
-					numOutOfOrder++
-					level.Debug(r.logger).Log("msg", "Out of order sample", "lset", lset, "sample", s)
-				case storage.ErrDuplicateSampleForTimestamp:
-					numDuplicates++
-					level.Debug(r.logger).Log("msg", "Duplicate sample for timestamp", "lset", lset, "sample", s)
-				case storage.ErrOutOfBounds:
-					numOutOfBounds++
-					level.Debug(r.logger).Log("msg", "Out of bounds metric", "lset", lset, "sample", s)
-				}
-			}
-
-			// Current implemetation of app.AppendExemplar doesn't create a new series, so it must be already present.
-			// We drop the exemplars in case the series doesn't exist.
-			if ref != 0 && len(t.Exemplars) > 0 {
-				for _, ex := range t.Exemplars {
-					exLset := labelpb.ZLabelsToPromLabels(ex.Labels)
-					logger := log.With(r.logger, "exemplarLset", exLset, "exemplar", ex.String())
-
-					_, err = app.AppendExemplar(ref, lset, exemplar.Exemplar{
-						Labels: exLset,
-						Value:  ex.Value,
-						Ts:     ex.Timestamp,
-						HasTs:  true,
-					})
-					switch err {
-					case storage.ErrOutOfOrderExemplar:
-						numExemplarsOutOfOrder++
-						level.Debug(logger).Log("msg", "Out of order exemplar")
-					case storage.ErrDuplicateExemplar:
-						numExemplarsDuplicate++
-						level.Debug(logger).Log("msg", "Duplicate exemplar")
-					case storage.ErrExemplarLabelLength:
-						numExemplarsLabelLength++
-						level.Debug(logger).Log("msg", "Label length for exemplar exceeds max limit", "limit", exemplar.ExemplarMaxLabelSetLength)
-					default:
-						if err != nil {
-							level.Debug(logger).Log("msg", "Error ingesting exemplar", "err", err)
-						}
+				case storage.ErrOutOfOrderExemplar:
+					numExemplarsOutOfOrder++
+					level.Debug(logger).Log("msg", "Out of order exemplar")
+				case storage.ErrDuplicateExemplar:
+					numExemplarsDuplicate++
+					level.Debug(logger).Log("msg", "Duplicate exemplar")
+				case storage.ErrExemplarLabelLength:
+					numExemplarsLabelLength++
+					level.Debug(logger).Log("msg", "Label length for exemplar exceeds max limit", "limit", exemplar.ExemplarMaxLabelSetLength)
+				default:
+					if err != nil {
+						level.Debug(logger).Log("msg", "Error ingesting exemplar", "err", err)
 					}
 				}
 			}
 		}
-	}, opentracing.Tags{"timeseriesCount": timeseriesCount, "samplesCount": samplesCount})
-
+	}
+	span.SetTag("timeseriesCount", timeseriesCount)
+	span.SetTag("samplesCount", samplesCount)
+	span.Finish()
 
 	if numOutOfOrder > 0 {
 		level.Warn(r.logger).Log("msg", "Error on ingesting out-of-order samples", "numDropped", numOutOfOrder)
