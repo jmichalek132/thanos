@@ -31,6 +31,7 @@ import (
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -40,12 +41,14 @@ import (
 	statusapi "github.com/thanos-io/thanos/pkg/api/status"
 	"github.com/thanos-io/thanos/pkg/logging"
 
+	"github.com/prometheus/prometheus/prompb"
+	otlptranslator "github.com/prometheus/prometheus/storage/remote/otlptranslator/prometheusremotewrite"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/server/http/middleware"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
+	tprompb "github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
@@ -236,6 +239,18 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 		),
 	)
 
+	h.router.Post(
+		"/v1/metrics",
+		instrf(
+			"otlp",
+			readyf(
+				middleware.RequestID(
+					http.HandlerFunc(h.receiveOTLPHTTP),
+				),
+			),
+		),
+	)
+
 	statusAPI := statusapi.New(statusapi.Options{
 		GetStats: h.getStats,
 		Registry: h.options.Registry,
@@ -419,7 +434,7 @@ type endpointReplica struct {
 
 type trackedSeries struct {
 	seriesIDs  []int
-	timeSeries []prompb.TimeSeries
+	timeSeries []tprompb.TimeSeries
 }
 
 type writeResponse struct {
@@ -434,7 +449,7 @@ func newWriteResponse(seriesIDs []int, err error) writeResponse {
 	}
 }
 
-func (h *Handler) handleRequest(ctx context.Context, rep uint64, tenant string, wreq *prompb.WriteRequest) error {
+func (h *Handler) handleRequest(ctx context.Context, rep uint64, tenant string, wreq *tprompb.WriteRequest) error {
 	tLogger := log.With(h.logger, "tenant", tenant)
 
 	// This replica value is used to detect cycles in cyclic topologies.
@@ -535,7 +550,7 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	// NOTE: Due to zero copy ZLabels, Labels used from WriteRequests keeps memory
 	// from the whole request. Ensure that we always copy those when we want to
 	// store them for longer time.
-	var wreq prompb.WriteRequest
+	var wreq tprompb.WriteRequest
 	if err := proto.Unmarshal(reqBuf, &wreq); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -606,6 +621,192 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	h.writeSamplesTotal.WithLabelValues(strconv.Itoa(responseStatusCode), tenant).Observe(float64(totalSamples))
 }
 
+func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
+	var err error
+	span, ctx := tracing.StartSpan(r.Context(), "receive_otlphttp")
+	defer span.Finish()
+
+	tenant, err := tenancy.GetTenantFromHTTP(r, h.options.TenantHeader, h.options.DefaultTenantID, h.options.TenantField)
+	if err != nil {
+		level.Error(h.logger).Log("msg", "error getting tenant from HTTP", "err", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	tLogger := log.With(h.logger, "tenant", tenant)
+
+	writeGate := h.Limiter.WriteGate()
+	tracing.DoInSpan(r.Context(), "receive_write_gate_ismyturn", func(ctx context.Context) {
+		err = writeGate.Start(r.Context())
+	})
+	defer writeGate.Done()
+	if err != nil {
+		level.Error(tLogger).Log("err", err, "msg", "internal server error")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	under, err := h.Limiter.HeadSeriesLimiter().isUnderLimit(tenant)
+	if err != nil {
+		level.Error(tLogger).Log("msg", "error while limiting", "err", err.Error())
+	}
+
+	// Fail request fully if tenant has exceeded set limit.
+	if !under {
+		http.Error(w, "tenant is above active series limit", http.StatusTooManyRequests)
+		return
+	}
+
+	// TODO Fix getting rid of the memory limiting sutff for now
+	/*	requestLimiter := h.Limiter.RequestLimiter()
+		// io.ReadAll dynamically adjust the byte slice for read data, starting from 512B.
+		// Since this is receive hot path, grow upfront saving allocations and CPU time.
+		compressed := bytes.Buffer{}
+		if r.ContentLength >= 0 {
+			if !requestLimiter.AllowSizeBytes(tenant, r.ContentLength) {
+				http.Error(w, "write request too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			compressed.Grow(int(r.ContentLength))
+		} else {
+			compressed.Grow(512)
+		}
+		_, err = io.Copy(&compressed, r.Body)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
+			return
+		}
+		reqBuf, err := s2.Decode(nil, compressed.Bytes())
+		if err != nil {
+			level.Error(tLogger).Log("msg", "snappy decode error", "err", err)
+			http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
+			return
+		}
+
+		if !requestLimiter.AllowSizeBytes(tenant, int64(len(reqBuf))) {
+			http.Error(w, "write request too large", http.StatusRequestEntityTooLarge)
+			return
+		}*/
+
+	// NOTE: Due to zero copy ZLabels, Labels used from WriteRequests keeps memory
+	// from the whole request. Ensure that we always copy those when we want to
+	// store them for longer time.
+	/*	var wreq prompb.WriteRequest
+		if err := proto.Unmarshal(reqBuf, &wreq); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}*/
+
+	req, err := remote.DecodeOTLPWriteRequest(r)
+	if err != nil {
+		level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	prwMetricsMap, errs := otlptranslator.FromMetrics(req.Metrics(), otlptranslator.Settings{
+		AddMetricSuffixes: true,
+	})
+	if errs != nil {
+		level.Warn(h.logger).Log("msg", "Error translating OTLP metrics to Prometheus write request", "err", errs)
+	}
+
+	prwMetrics := make([]tprompb.TimeSeries, 0, 100)
+
+	for _, ts := range prwMetricsMap {
+		t := promToThanosTimeseries(ts)
+		prwMetrics = append(prwMetrics, t)
+	}
+
+	wreq := tprompb.WriteRequest{
+		Timeseries: prwMetrics,
+	}
+
+	rep := uint64(0)
+	// If the header is empty, we assume the request is not yet replicated.
+	//if replicaRaw := r.Header.Get(h.options.ReplicaHeader); replicaRaw != "" {
+	//	if rep, err = strconv.ParseUint(replicaRaw, 10, 64); err != nil {
+	//		http.Error(w, "could not parse replica header", http.StatusBadRequest)
+	//		return
+	//	}
+	//}
+
+	// Exit early if the request contained no data. We don't support metadata yet. We also cannot fail here, because
+	// this would mean lack of forward compatibility for remote write proto.
+	if len(wreq.Timeseries) == 0 {
+		// TODO(yeya24): Handle remote write metadata.
+		if len(wreq.Metadata) > 0 {
+			// TODO(bwplotka): Do we need this error message?
+			level.Debug(tLogger).Log("msg", "only metadata from client; metadata ingestion not supported; skipping")
+			return
+		}
+		level.Debug(tLogger).Log("msg", "empty remote write request; client bug or newer remote write protocol used?; skipping")
+		return
+	}
+
+	//if !requestLimiter.AllowSeries(tenant, int64(len(wreq.Timeseries))) {
+	//	http.Error(w, "too many timeseries", http.StatusRequestEntityTooLarge)
+	//	return
+	//}
+
+	totalSamples := 0
+	for _, timeseries := range wreq.Timeseries {
+		totalSamples += len(timeseries.Samples)
+	}
+	//if !requestLimiter.AllowSamples(tenant, int64(totalSamples)) {
+	//	http.Error(w, "too many samples", http.StatusRequestEntityTooLarge)
+	//	return
+	//}
+
+	// Apply relabeling configs.
+	h.relabel(&wreq)
+	if len(wreq.Timeseries) == 0 {
+		level.Debug(tLogger).Log("msg", "remote write request dropped due to relabeling.")
+		return
+	}
+
+	responseStatusCode := http.StatusOK
+	if err = h.handleRequest(ctx, rep, tenant, &wreq); err != nil {
+		level.Debug(tLogger).Log("msg", "failed to handle request", "err", err)
+		switch errors.Cause(err) {
+		case errNotReady:
+			responseStatusCode = http.StatusServiceUnavailable
+		case errUnavailable:
+			responseStatusCode = http.StatusServiceUnavailable
+		case errConflict:
+			responseStatusCode = http.StatusConflict
+		case errBadReplica:
+			responseStatusCode = http.StatusBadRequest
+		default:
+			level.Error(tLogger).Log("err", err, "msg", "internal server error")
+			responseStatusCode = http.StatusInternalServerError
+		}
+		http.Error(w, err.Error(), responseStatusCode)
+	}
+	h.writeTimeseriesTotal.WithLabelValues(strconv.Itoa(responseStatusCode), tenant).Observe(float64(len(wreq.Timeseries)))
+	h.writeSamplesTotal.WithLabelValues(strconv.Itoa(responseStatusCode), tenant).Observe(float64(totalSamples))
+}
+
+func promToThanosTimeseries(tsMap *prompb.TimeSeries) tprompb.TimeSeries {
+	labels := make([]labelpb.ZLabel, 0, len(tsMap.Labels))
+	for _, label := range tsMap.Labels {
+		labels = append(labels, labelpb.ZLabel{
+			Name:  label.Name,
+			Value: label.Value,
+		})
+	}
+	samples := make([]tprompb.Sample, 0, len(tsMap.Samples))
+	for _, sample := range tsMap.Samples {
+		samples = append(samples, tprompb.Sample{
+			Timestamp: sample.Timestamp,
+			Value:     sample.Value,
+		})
+	}
+	return tprompb.TimeSeries{
+		Labels: labels, Samples: samples,
+	}
+}
+
 // forward accepts a write request, batches its time series by
 // corresponding endpoint, and forwards them in parallel to the
 // correct endpoint. Requests destined for the local node are written
@@ -614,7 +815,7 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 // unless the request needs to be replicated.
 // The function only returns when all requests have finished
 // or the context is canceled.
-func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *prompb.WriteRequest) error {
+func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *tprompb.WriteRequest) error {
 	span, ctx := tracing.StartSpan(ctx, "receive_fanout_forward")
 	defer span.Finish()
 
@@ -648,7 +849,7 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 			if !ok {
 				writeTarget = trackedSeries{
 					seriesIDs:  make([]int, 0),
-					timeSeries: make([]prompb.TimeSeries, 0),
+					timeSeries: make([]tprompb.TimeSeries, 0),
 				}
 			}
 			writeTarget.timeSeries = append(wreqs[key].timeSeries, ts)
@@ -731,7 +932,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, wreqs map[e
 		var err error
 
 		tracing.DoInSpan(fctx, "receive_tsdb_write", func(_ context.Context) {
-			err = h.writer.Write(fctx, tenant, &prompb.WriteRequest{
+			err = h.writer.Write(fctx, tenant, &tprompb.WriteRequest{
 				Timeseries: wreqs[writeTarget].timeSeries,
 			})
 		})
@@ -882,7 +1083,7 @@ func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*st
 	span, ctx := tracing.StartSpan(ctx, "receive_grpc")
 	defer span.Finish()
 
-	err := h.handleRequest(ctx, uint64(r.Replica), r.Tenant, &prompb.WriteRequest{Timeseries: r.Timeseries})
+	err := h.handleRequest(ctx, uint64(r.Replica), r.Tenant, &tprompb.WriteRequest{Timeseries: r.Timeseries})
 	if err != nil {
 		level.Debug(h.logger).Log("msg", "failed to handle request", "err", err)
 	}
@@ -903,11 +1104,11 @@ func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*st
 }
 
 // relabel relabels the time series labels in the remote write request.
-func (h *Handler) relabel(wreq *prompb.WriteRequest) {
+func (h *Handler) relabel(wreq *tprompb.WriteRequest) {
 	if len(h.options.RelabelConfigs) == 0 {
 		return
 	}
-	timeSeries := make([]prompb.TimeSeries, 0, len(wreq.Timeseries))
+	timeSeries := make([]tprompb.TimeSeries, 0, len(wreq.Timeseries))
 	for _, ts := range wreq.Timeseries {
 		var keep bool
 		lbls, keep := relabel.Process(labelpb.ZLabelsToPromLabels(ts.Labels), h.options.RelabelConfigs...)
