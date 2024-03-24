@@ -730,15 +730,6 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 		//Metadata: otlptranslator.OtelMetricsToMetadata(),
 	}
 
-	rep := uint64(0)
-	// If the header is empty, we assume the request is not yet replicated.
-	//if replicaRaw := r.Header.Get(h.options.ReplicaHeader); replicaRaw != "" {
-	//	if rep, err = strconv.ParseUint(replicaRaw, 10, 64); err != nil {
-	//		http.Error(w, "could not parse replica header", http.StatusBadRequest)
-	//		return
-	//	}
-	//}
-
 	// Exit early if the request contained no data. We don't support metadata yet. We also cannot fail here, because
 	// this would mean lack of forward compatibility for remote write proto.
 	if len(wreq.Timeseries) == 0 {
