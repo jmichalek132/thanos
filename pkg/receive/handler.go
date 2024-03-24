@@ -730,6 +730,8 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 		//Metadata: otlptranslator.OtelMetricsToMetadata(),
 	}
 
+	rep := uint64(0)
+
 	// Exit early if the request contained no data. We don't support metadata yet. We also cannot fail here, because
 	// this would mean lack of forward compatibility for remote write proto.
 	if len(wreq.Timeseries) == 0 {
