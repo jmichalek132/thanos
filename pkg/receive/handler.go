@@ -239,6 +239,7 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 		),
 	)
 
+	// TODO add feature flag for enabling the endpoint
 	h.router.Post(
 		"/v1/metrics",
 		instrf(
@@ -657,37 +658,36 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO Fix getting rid of the memory limiting sutff for now
-	/*	requestLimiter := h.Limiter.RequestLimiter()
-		// io.ReadAll dynamically adjust the byte slice for read data, starting from 512B.
-		// Since this is receive hot path, grow upfront saving allocations and CPU time.
-		compressed := bytes.Buffer{}
-		if r.ContentLength >= 0 {
-			if !requestLimiter.AllowSizeBytes(tenant, r.ContentLength) {
-				http.Error(w, "write request too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			compressed.Grow(int(r.ContentLength))
-		} else {
-			compressed.Grow(512)
-		}
-		_, err = io.Copy(&compressed, r.Body)
-		if err != nil {
-			http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
-			return
-		}
-		reqBuf, err := s2.Decode(nil, compressed.Bytes())
-		if err != nil {
-			level.Error(tLogger).Log("msg", "snappy decode error", "err", err)
-			http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
-			return
-		}
-
-		if !requestLimiter.AllowSizeBytes(tenant, int64(len(reqBuf))) {
-			http.Error(w, "write request too large", http.StatusRequestEntityTooLarge)
-			return
-		}*/
-
+	requestLimiter := h.Limiter.RequestLimiter()
+	// TODO Fix getting rid of the memory limiting stuff for now
+	// io.ReadAll dynamically adjust the byte slice for read data, starting from 512B.
+	// Since this is receive hot path, grow upfront saving allocations and CPU time.
+	//compressed := bytes.Buffer{}
+	//if r.ContentLength >= 0 {
+	//	if !requestLimiter.AllowSizeBytes(tenant, r.ContentLength) {
+	//		http.Error(w, "write request too large", http.StatusRequestEntityTooLarge)
+	//		return
+	//	}
+	//	compressed.Grow(int(r.ContentLength))
+	//} else {
+	//	compressed.Grow(512)
+	//}
+	//_, err = io.Copy(&compressed, r.Body)
+	//if err != nil {
+	//	http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
+	//	return
+	//}
+	//reqBuf, err := s2.Decode(nil, compressed.Bytes())
+	//if err != nil {
+	//	level.Error(tLogger).Log("msg", "snappy decode error", "err", err)
+	//	http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
+	//	return
+	//}
+	//
+	//if !requestLimiter.AllowSizeBytes(tenant, int64(len(reqBuf))) {
+	//	http.Error(w, "write request too large", http.StatusRequestEntityTooLarge)
+	//	return
+	//}
 	// NOTE: Due to zero copy ZLabels, Labels used from WriteRequests keeps memory
 	// from the whole request. Ensure that we always copy those when we want to
 	// store them for longer time.
@@ -745,19 +745,19 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	//if !requestLimiter.AllowSeries(tenant, int64(len(wreq.Timeseries))) {
-	//	http.Error(w, "too many timeseries", http.StatusRequestEntityTooLarge)
-	//	return
-	//}
+	if !requestLimiter.AllowSeries(tenant, int64(len(wreq.Timeseries))) {
+		http.Error(w, "too many timeseries", http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	totalSamples := 0
 	for _, timeseries := range wreq.Timeseries {
 		totalSamples += len(timeseries.Samples)
 	}
-	//if !requestLimiter.AllowSamples(tenant, int64(totalSamples)) {
-	//	http.Error(w, "too many samples", http.StatusRequestEntityTooLarge)
-	//	return
-	//}
+	if !requestLimiter.AllowSamples(tenant, int64(totalSamples)) {
+		http.Error(w, "too many samples", http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	// Apply relabeling configs.
 	h.relabel(&wreq)
