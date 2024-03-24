@@ -726,7 +726,7 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 
 	wreq := tprompb.WriteRequest{
 		Timeseries: prwMetrics,
-		// TODO Handle metadata
+		// TODO Handle metadata, requires thanos receiver support ingesting metadata
 		//Metadata: otlptranslator.OtelMetricsToMetadata(),
 	}
 
