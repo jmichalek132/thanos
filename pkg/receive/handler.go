@@ -704,6 +704,7 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// TODO expose otlptranslator.Settings as config options
 	prwMetricsMap, errs := otlptranslator.FromMetrics(req.Metrics(), otlptranslator.Settings{
 		AddMetricSuffixes: true,
 	})
@@ -714,12 +715,19 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 	prwMetrics := make([]tprompb.TimeSeries, 0, 100)
 
 	for _, ts := range prwMetricsMap {
-		t := promToThanosTimeseries(ts)
+		t := tprompb.TimeSeries{
+			Labels:    makeLabels(ts.Labels),
+			Samples:   makeSamples(ts.Samples),
+			Exemplars: makeExemplars(ts.Exemplars),
+			// TODO handle historgrams
+		}
 		prwMetrics = append(prwMetrics, t)
 	}
 
 	wreq := tprompb.WriteRequest{
 		Timeseries: prwMetrics,
+		// TODO Handle metadata
+		//Metadata: otlptranslator.OtelMetricsToMetadata(),
 	}
 
 	rep := uint64(0)
@@ -787,24 +795,35 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 	h.writeSamplesTotal.WithLabelValues(strconv.Itoa(responseStatusCode), tenant).Observe(float64(totalSamples))
 }
 
-func promToThanosTimeseries(tsMap *prompb.TimeSeries) tprompb.TimeSeries {
-	labels := make([]labelpb.ZLabel, 0, len(tsMap.Labels))
-	for _, label := range tsMap.Labels {
-		labels = append(labels, labelpb.ZLabel{
-			Name:  label.Name,
-			Value: label.Value,
+func makeLabels(in []prompb.Label) []labelpb.ZLabel {
+	out := make([]labelpb.ZLabel, 0, len(in))
+	for _, l := range in {
+		out = append(out, labelpb.ZLabel{Name: l.Name, Value: l.Value})
+	}
+	return out
+}
+
+func makeSamples(in []prompb.Sample) []tprompb.Sample {
+	out := make([]tprompb.Sample, 0, len(in))
+	for _, s := range in {
+		out = append(out, tprompb.Sample{
+			Value:     s.Value,
+			Timestamp: s.Timestamp,
 		})
 	}
-	samples := make([]tprompb.Sample, 0, len(tsMap.Samples))
-	for _, sample := range tsMap.Samples {
-		samples = append(samples, tprompb.Sample{
-			Timestamp: sample.Timestamp,
-			Value:     sample.Value,
+	return out
+}
+
+func makeExemplars(in []prompb.Exemplar) []tprompb.Exemplar {
+	out := make([]tprompb.Exemplar, 0, len(in))
+	for _, e := range in {
+		out = append(out, tprompb.Exemplar{
+			Labels:    makeLabels(e.Labels),
+			Value:     e.Value,
+			Timestamp: e.Timestamp,
 		})
 	}
-	return tprompb.TimeSeries{
-		Labels: labels, Samples: samples,
-	}
+	return out
 }
 
 // forward accepts a write request, batches its time series by
